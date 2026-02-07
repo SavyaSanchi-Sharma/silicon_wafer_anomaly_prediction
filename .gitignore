@@ -1,5 +1,9 @@
+/data/clean/
+/data/d1/
+/data/d2/
+/data/dataset/
+/data/dataset_preprocessed/
 /data/temp/
-/data/test/
-/data/train/
-/data/valid/
-
+.vscode/*
+*/__pycache__/*
+.pyc
