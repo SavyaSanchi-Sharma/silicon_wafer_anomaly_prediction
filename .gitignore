@@ -3,7 +3,9 @@
 /data/d2/
 /data/dataset/
 /data/dataset_preprocessed/
+/data/dataset_balanced/
 /data/temp/
 .vscode/*
 */__pycache__/*
 .pyc
+src/train_classification_only.py

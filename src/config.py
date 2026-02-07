@@ -1,16 +1,45 @@
-from pathlib import Path
+import torch
+import numpy as np
 
-DATA_ROOT = Path("../data/dataset_preprocessed")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-IMG_SIZE = 128
-NUM_CLASSES = 8
-BATCH_SIZE = 32
-EPOCHS = 30
-LR = 1e-3
+HARDWARE_PROFILE = "MEDIUM"
 
-DEVICE = "cuda"
+HARDWARE_CONFIGS = {
+    "LOW": {
+        "batch_size": 16,
+        "img_size": 128,
+        "num_workers": 2,
+        "use_amp": True,
+        "gradient_accumulation": 4,
+    },
+    "MEDIUM": {
+        "batch_size": 32,
+        "img_size": 224,
+        "num_workers": 4,
+        "use_amp": True,
+        "gradient_accumulation": 2,
+    },
+    "HIGH": {
+        "batch_size": 64,
+        "img_size": 224,
+        "num_workers": 8,
+        "use_amp": True,
+        "gradient_accumulation": 1,
+    }
+}
 
-CLASS_NAMES = [
+HW_CONFIG = HARDWARE_CONFIGS[HARDWARE_PROFILE]
+
+IMG_SIZE = HW_CONFIG["img_size"]
+BATCH_SIZE = HW_CONFIG["batch_size"]
+NUM_WORKERS = HW_CONFIG["num_workers"]
+
+TRAIN_DIR = "../data/dataset_balanced/train"
+VAL_DIR = "../data/dataset_balanced/val"
+TEST_DIR = "../data/dataset_balanced/test"
+
+CLASSES = [
     "clean",
     "scratch",
     "particle",
@@ -18,5 +47,138 @@ CLASS_NAMES = [
     "contamination",
     "coating_defect",
     "etch_defect",
-    "other",
+    "other"
 ]
+
+CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
+IDX_TO_CLASS = {i: c for c, i in CLASS_TO_IDX.items()}
+
+NUM_CLASSES = len(CLASSES)
+CLEAN_CLASS_ID = CLASS_TO_IDX["clean"]
+
+CLASS_WEIGHTS = None
+
+USE_RESIDUAL = True
+USE_SE_BLOCKS = True
+USE_DROPOUT = True
+DROPOUT_RATE = 0.3
+SE_REDUCTION = 16
+USE_GEM_POOLING = False
+
+SEED = 42
+
+EPOCHS_DET = 10
+EPOCHS_TOTAL = 40
+
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+BETAS = (0.9, 0.999)
+EPS = 1e-8
+
+LR_SCHEDULER = True
+LR_PATIENCE = 5
+LR_FACTOR = 0.5
+LR_MIN = 1e-6
+
+EARLY_STOPPING = True
+EARLY_STOPPING_PATIENCE = 10
+
+USE_AMP = HW_CONFIG["use_amp"]
+
+GRADIENT_ACCUMULATION_STEPS = HW_CONFIG["gradient_accumulation"]
+EFFECTIVE_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+
+GRAD_CLIP_NORM = 1.0
+
+LAMBDA_DET = 1.0
+LAMBDA_CLS = 1.5
+
+FOCAL_GAMMA = 2.0
+FOCAL_ALPHA = None
+
+LABEL_SMOOTHING = 0.1
+
+USE_AUGMENTATION = True
+
+AUG_ROTATE_P = 0.5
+AUG_FLIP_H_P = 0.5
+AUG_FLIP_V_P = 0.5
+AUG_SHIFT_SCALE_ROTATE_P = 0.5
+AUG_BRIGHTNESS_CONTRAST_P = 0.3
+AUG_NOISE_P = 0.2
+AUG_BLUR_P = 0.1
+AUG_GRID_DISTORTION_P = 0.2
+
+AUG_BRIGHTNESS_LIMIT = 0.2
+AUG_CONTRAST_LIMIT = 0.2
+AUG_SHIFT_LIMIT = 0.1
+AUG_SCALE_LIMIT = 0.1
+AUG_ROTATE_LIMIT = 15
+
+VAL_FREQUENCY = 1
+DETECTION_THRESHOLD = 0.5
+
+LOG_DIR = "logs"
+CHECKPOINT_DIR = "checkpoints"
+RESULTS_DIR = "results"
+
+import os
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(os.path.join(LOG_DIR, "tensorboard"), exist_ok=True)
+
+SAVE_BEST_ONLY = True
+CHECKPOINT_METRIC = "val_loss"
+
+LOG_INTERVAL = 10
+
+def set_seed(seed=SEED):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def get_config_summary():
+    img_size_str = f"{IMG_SIZE}x{IMG_SIZE}"
+    batch_str = f"{BATCH_SIZE} (Effective: {EFFECTIVE_BATCH_SIZE})"
+    dropout_str = f"Dropout (p={DROPOUT_RATE})"
+    summary = f"""
+    ╔════════════════════════════════════════════════════════════╗
+    ║         Silicon Wafer Anomaly Detection Config            ║
+    ╠════════════════════════════════════════════════════════════╣
+    ║ Hardware Profile: {HARDWARE_PROFILE:<40} ║
+    ║ Device: {DEVICE:<49} ║
+    ║ Image Size: {img_size_str:<52} ║
+    ║ Batch Size: {batch_str:<52} ║
+    ║ Mixed Precision: {str(USE_AMP):<44} ║
+    ╠════════════════════════════════════════════════════════════╣
+    ║ Classes: {NUM_CLASSES:<52} ║
+    ║ Detection Epochs: {EPOCHS_DET:<46} ║
+    ║ Total Epochs: {EPOCHS_TOTAL:<49} ║
+    ║ Learning Rate: {LR:<49.0e} ║
+    ║ Weight Decay: {WEIGHT_DECAY:<50.0e} ║
+    ╠════════════════════════════════════════════════════════════╣
+    ║ Residual Connections: {str(USE_RESIDUAL):<41} ║
+    ║ SE Attention: {str(USE_SE_BLOCKS):<49} ║
+    ║ {dropout_str}: {str(USE_DROPOUT):<40} ║
+    ║ Augmentation: {str(USE_AUGMENTATION):<49} ║
+    ╚════════════════════════════════════════════════════════════╝
+    """
+    return summary
+
+def calculate_class_weights(class_counts, method="inverse_freq"):
+    counts = np.array([class_counts.get(i, 1) for i in range(NUM_CLASSES)])
+    total = counts.sum()
+    if method == "inverse_freq":
+        weights = total / (NUM_CLASSES * counts)
+    elif method == "effective_num":
+        beta = (total - 1) / total
+        weights = (1 - beta) / (1 - np.power(beta, counts))
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    weights = weights / weights.sum() * NUM_CLASSES
+    return torch.FloatTensor(weights).to(DEVICE)
