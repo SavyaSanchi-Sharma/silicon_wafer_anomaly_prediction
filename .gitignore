@@ -1,15 +1,10 @@
-/data/clean/
-/data/d1/
-/data/temp/
-/data/d2/
-/data/dataset/
-/data/dataset_preprocessed/
-/data/dataset_balanced/
-/data/temp/
+/data/*
 .vscode
 __pycache__
-.pyc
-checkpoints
-wafernet.pth
+*.pyc
+checkpoints/*
+*.pth
+*/logs/
+**/logs
 
 
