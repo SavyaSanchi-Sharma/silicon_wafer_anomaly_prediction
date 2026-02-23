@@ -5,66 +5,88 @@ import numpy as np
 from torch.utils.data import Dataset
 from config import CLASS_TO_IDX, IMG_SIZE
 
+
 class WaferDataset(Dataset):
-    
+
     def __init__(self, root, transform=None):
         self.root = root
         self.transform = transform
         self.samples = []
-        
+
         if not os.path.exists(root):
             raise ValueError(f"Dataset directory not found: {root}")
-        
+
+        # Create CLAHE ONCE
+        self.clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8)
+        )
+
         for class_name, class_idx in CLASS_TO_IDX.items():
+
             cls_path = os.path.join(root, class_name)
-            
+
             if not os.path.isdir(cls_path):
-                print(f"Warning: Class directory not found: {cls_path}")
+                print(f"Warning: missing {cls_path}")
                 continue
-            
+
             for filename in os.listdir(cls_path):
-                if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                if filename.lower().endswith(
+                    (".jpg", ".jpeg", ".png", ".bmp")
+                ):
                     img_path = os.path.join(cls_path, filename)
-                    
-                    if os.path.isfile(img_path):
-                        self.samples.append((img_path, class_idx))
-        
+                    self.samples.append((img_path, class_idx))
+
         if len(self.samples) == 0:
-            raise ValueError(f"No valid images found in {root}")
-        
+            raise ValueError(f"No images found in {root}")
+
+        # deterministic order
+        self.samples.sort()
+
         print(f"Loaded {len(self.samples)} samples from {root}")
-    
+
     def __len__(self):
         return len(self.samples)
-    
+
     def __getitem__(self, idx):
+
         path, label = self.samples[idx]
-        
+
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        
+
         if img is None:
             raise ValueError(f"Failed to load image: {path}")
-        
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-        
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        img = clahe.apply(img)
-        
+
+        # resize first
+        img = cv2.resize(
+            img,
+            (IMG_SIZE, IMG_SIZE),
+            interpolation=cv2.INTER_AREA,
+        )
+
+        # augment BEFORE CLAHE
         if self.transform is not None:
-            augmented = self.transform(image=img)
-            img = augmented['image']
-        
+            img = self.transform(image=img)["image"]
+
+        # CLAHE after augmentation
+        img = self.clahe.apply(img)
+
+        # normalize [-1,1]
         img = img.astype(np.float32) / 255.0
-        
+        img = (img - 0.5) / 0.5
+
         img = np.expand_dims(img, 0)
-        
         img = torch.from_numpy(img)
-        
+
         is_defective = 0 if label == 0 else 1
-        
-        return img, torch.tensor(is_defective), torch.tensor(label)
-    
+
+        return (
+            img,
+            torch.tensor(is_defective, dtype=torch.float32),
+            torch.tensor(label, dtype=torch.long),
+        )
+
     def get_class_distribution(self):
         from collections import Counter
-        class_counts = Counter([label for _, label in self.samples])
-        return dict(sorted(class_counts.items()))
+        counts = Counter(label for _, label in self.samples)
+        return dict(sorted(counts.items()))

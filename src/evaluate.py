@@ -1,213 +1,250 @@
-"""
-Comprehensive evaluation script for Silicon Wafer Anomaly Detection model.
-
-Features:
-- Detailed per-class metrics
-- Confusion matrix visualization
-- ROC curves
-- Statistical analysis
-- Bootstrap confidence intervals
-"""
-
 import torch
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
+from sklearn.metrics import f1_score
 
 from config import *
 from dataset import WaferDataset
 from model import create_model
-from utils import (calculate_metrics, plot_confusion_matrix, plot_roc_curves,
-                  save_metrics_report)
-from augmentations import get_validation_augmentation, get_test_time_augmentation
+from utils import (
+    calculate_metrics,
+    plot_confusion_matrix,
+    plot_roc_curves,
+    save_metrics_report
+)
+from augmentations import get_validation_augmentation
 
+# ============================================================
+# SIMPLE GPU-SAFE TTA AUGMENTATIONS
+# ============================================================
+
+def apply_tta_batch(img, mode):
+    if mode == "none":
+        return img
+    elif mode == "hflip":
+        return torch.flip(img, dims=[3])
+    elif mode == "vflip":
+        return torch.flip(img, dims=[2])
+    elif mode == "rot90":
+        return torch.rot90(img, k=1, dims=[2, 3])
+    else:
+        raise ValueError(mode)
+
+
+TTA_MODES = [
+    "none",
+    "hflip",
+    "vflip",
+    "rot90",
+]
+
+
+# ============================================================
+# Inference
+# ============================================================
 
 @torch.no_grad()
-def evaluate_model(model, dataloader, use_tta=False, tta_transforms=None):
+def evaluate_model(model, dataloader, threshold, use_tta=False):
+
     model.eval()
+
     all_labels = []
     all_preds = []
     all_probs = []
-    print("Evaluating model...")
-    pbar = tqdm(dataloader, desc="Inference")
-    for img, is_def, cls in pbar:
+
+    for img, _, cls in tqdm(dataloader, desc="Inference"):
+
         img = img.to(DEVICE)
-        cls_labels = cls.numpy()
-        if use_tta and tta_transforms:
-            tta_det_probs = []
-            tta_cls_probs = []
-            for transform in tta_transforms:
-                if transform is None:
-                    img_aug = img
-                else:
-                    img_aug_list = []
-                    for i in range(img.shape[0]):
-                        img_np = img[i, 0].cpu().numpy()
-                        if transform:
-                            img_aug_np = transform(image=img_np)['image']
-                        else:
-                            img_aug_np = img_np
-                        img_aug_list.append(torch.from_numpy(img_aug_np).unsqueeze(0))
-                    img_aug = torch.stack(img_aug_list).to(DEVICE)
-                det_logit, cls_logit = model(img_aug)
-                det_prob = torch.sigmoid(det_logit).cpu()
-                cls_prob = F.softmax(cls_logit, dim=1).cpu()
-                tta_det_probs.append(det_prob)
-                tta_cls_probs.append(cls_prob)
-            det_prob = torch.stack(tta_det_probs).mean(dim=0).view(-1).numpy()
-            cls_prob = torch.stack(tta_cls_probs).mean(dim=0).numpy()
-        else:
+        labels = cls.numpy()
+
+        # ---------- Forward ----------
+        if not use_tta:
+
             det_logit, cls_logit = model(img)
-            det_prob = torch.sigmoid(det_logit).view(-1).cpu().numpy()
-            cls_prob = F.softmax(cls_logit, dim=1).cpu().numpy()
+
+            det_prob = torch.sigmoid(det_logit).view(-1)
+            cls_prob = F.softmax(cls_logit, dim=1)
+
+        else:
+            det_accum = []
+            cls_accum = []
+
+            for mode in TTA_MODES:
+                img_aug = apply_tta_batch(img, mode)
+
+                d, c = model(img_aug)
+
+                det_accum.append(torch.sigmoid(d))
+                cls_accum.append(F.softmax(c, dim=1))
+
+            det_prob = torch.stack(det_accum).mean(0).view(-1)
+            cls_prob = torch.stack(cls_accum).mean(0)
+
+        det_prob = det_prob.cpu().numpy()
+        cls_prob = cls_prob.cpu().numpy()
+
+        # ---------- Hierarchical prediction ----------
         cls_pred = np.argmax(cls_prob, axis=1)
+
         final_preds = []
+        combined_probs = cls_prob.copy()
+
         for i in range(len(det_prob)):
-            if det_prob[i] < DETECTION_THRESHOLD:
+
+            if det_prob[i] < threshold:
                 final_preds.append(CLEAN_CLASS_ID)
             else:
                 final_preds.append(cls_pred[i])
-        all_labels.extend(cls_labels)
+
+            combined_probs[i, CLEAN_CLASS_ID] = 1 - det_prob[i]
+
+        all_labels.extend(labels)
         all_preds.extend(final_preds)
-        all_probs.extend(cls_prob)
-    return np.array(all_labels), np.array(all_preds), np.array(all_probs)
+        all_probs.extend(combined_probs)
+
+    return (
+        np.array(all_labels),
+        np.array(all_preds),
+        np.array(all_probs),
+    )
 
 
-def bootstrap_confidence_interval(y_true, y_pred, metric_fn, n_iterations=1000, confidence=0.95):
-    n_samples = len(y_true)
-    bootstrap_scores = []
-    for _ in range(n_iterations):
-        indices = np.random.choice(n_samples, n_samples, replace=True)
-        y_true_boot = y_true[indices]
-        y_pred_boot = y_pred[indices]
-        score = metric_fn(y_true_boot, y_pred_boot)
-        bootstrap_scores.append(score)
-    bootstrap_scores = np.array(bootstrap_scores)
-    alpha = 1 - confidence
-    lower_percentile = (alpha / 2) * 100
-    upper_percentile = (1 - alpha / 2) * 100
-    mean_score = np.mean(bootstrap_scores)
-    lower_bound = np.percentile(bootstrap_scores, lower_percentile)
-    upper_bound = np.percentile(bootstrap_scores, upper_percentile)
-    return mean_score, lower_bound, upper_bound
+# ============================================================
+# Threshold Calibration
+# ============================================================
 
+def find_best_threshold(model, val_loader):
+
+    print("\nCalibrating detection threshold...")
+
+    thresholds = np.linspace(0.1, 0.9, 41)
+
+    best_t = 0.5
+    best_f1 = 0
+
+    for t in thresholds:
+        y_true, y_pred, _ = evaluate_model(
+            model,
+            val_loader,
+            threshold=t,
+            use_tta=False,
+        )
+
+        f1 = f1_score(y_true, y_pred, average="macro")
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = t
+
+    print(f"Best threshold = {best_t:.3f} (F1={best_f1:.4f})")
+    return best_t
+
+
+# ============================================================
+# Bootstrap CI
+# ============================================================
+
+def bootstrap_ci(y_true, y_pred, metric_fn, n_iter=1000):
+
+    scores = []
+    n = len(y_true)
+
+    for _ in range(n_iter):
+        idx = np.random.choice(n, n, replace=True)
+        scores.append(metric_fn(y_true[idx], y_pred[idx]))
+
+    scores = np.array(scores)
+    return np.mean(scores), np.percentile(scores, 2.5), np.percentile(scores, 97.5)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
     set_seed(SEED)
-    print("="*80)
-    print("SILICON WAFER ANOMALY DETECTION - EVALUATION")
-    print("="*80 + "\n")
-    print("Loading test dataset...")
-    test_aug = get_validation_augmentation()
-    test_ds = WaferDataset(TEST_DIR, transform=test_aug)
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
-    )
-    print(f"Test samples: {len(test_ds)}")
-    test_dist = test_ds.get_class_distribution()
-    print("\nClass distribution (test):")
-    for class_idx, count in sorted(test_dist.items()):
-        class_name = IDX_TO_CLASS[class_idx]
-        print(f"  {class_name:20s}: {count:4d} samples")
-    print("\nLoading model...")
+
+    print("=" * 80)
+    print("WAFER DEFECT MODEL EVALUATION")
+    print("=" * 80)
+
+    val_ds = WaferDataset(VAL_DIR, transform=get_validation_augmentation())
+    test_ds = WaferDataset(TEST_DIR, transform=get_validation_augmentation())
+
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+
     model = create_model(None).to(DEVICE)
-    checkpoint_path = Path(CHECKPOINT_DIR) / 'best_model.pth'
-    if not checkpoint_path.exists():
-        print(f"❌ Checkpoint not found: {checkpoint_path}")
-        print("   Please train the model first using train.py")
-        return
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"✓ Loaded checkpoint from epoch {checkpoint['epoch']}")
-    print(f"  Validation loss: {checkpoint['val_loss']:.4f}")
-    print("\n" + "-"*80)
-    print("Standard Evaluation (No TTA)")
-    print("-"*80)
-    y_true, y_pred, y_prob = evaluate_model(model, test_loader, use_tta=False)
+
+    ckpt = torch.load(
+        Path(CHECKPOINT_DIR) / "best_model.pth",
+        map_location=DEVICE,
+        weights_only=False
+    )
+
+    model.load_state_dict(ckpt["model_state_dict"])
+    print(f"Loaded checkpoint (epoch {ckpt['epoch']})")
+
+    # ---------- threshold calibration ----------
+    best_threshold = find_best_threshold(model, val_loader)
+
+    # ---------- evaluation WITH TTA ----------
+    y_true, y_pred, y_prob = evaluate_model(
+        model,
+        test_loader,
+        threshold=best_threshold,
+        use_tta=True,
+    )
+
     metrics = calculate_metrics(
-        y_true, y_pred, y_prob,
+        y_true,
+        y_pred,
+        y_prob,
         class_names=CLASSES,
-        average='macro'
+        average="macro",
     )
-    print("\n📊 Overall Metrics:")
-    print(f"  Accuracy:        {metrics['accuracy']:.4f}")
-    print(f"  Macro Precision: {metrics['macro_precision']:.4f}")
-    print(f"  Macro Recall:    {metrics['macro_recall']:.4f}")
-    print(f"  Macro F1-Score:  {metrics['macro_f1']:.4f}")
-    if metrics.get('roc_auc'):
-        print(f"  ROC-AUC:         {metrics['roc_auc']:.4f}")
-    print("\n📋 Per-Class Metrics:")
-    print(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1-Score':>10} {'Support':>10}")
-    print("-"*72)
-    for i, class_name in enumerate(CLASSES):
-        prec = metrics['per_class']['precision'][i]
-        rec = metrics['per_class']['recall'][i]
-        f1 = metrics['per_class']['f1'][i]
-        sup = metrics['per_class']['support'][i]
-        print(f"{class_name:<20} {prec:>10.4f} {rec:>10.4f} {f1:>10.4f} {sup:>10d}")
-    print("\n🔬 Statistical Analysis (Bootstrap 95% CI):")
-    def accuracy_fn(yt, yp):
-        return (yt == yp).mean()
-    acc_mean, acc_lower, acc_upper = bootstrap_confidence_interval(
-        y_true, y_pred, accuracy_fn, n_iterations=1000
+
+    print("\nRESULTS")
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"Macro F1: {metrics['macro_f1']:.4f}")
+
+    mean, low, high = bootstrap_ci(
+        y_true,
+        y_pred,
+        lambda a, b: f1_score(a, b, average="macro"),
     )
-    print(f"  Accuracy: {acc_mean:.4f} [{acc_lower:.4f}, {acc_upper:.4f}]")
-    print("\n📈 Generating visualizations...")
-    cm_path = Path(RESULTS_DIR) / 'confusion_matrix.png'
-    plot_confusion_matrix(y_true, y_pred, CLASSES, save_path=cm_path, normalize=True)
-    roc_path = Path(RESULTS_DIR) / 'roc_curves.png'
-    plot_roc_curves(y_true, y_prob, CLASSES, save_path=roc_path)
-    report_path = Path(RESULTS_DIR) / 'evaluation_report.txt'
-    save_metrics_report(metrics, CLASSES, report_path)
-    USE_TTA_EVAL = False
-    if USE_TTA_EVAL:
-        print("\n" + "-"*80)
-        print("Test-Time Augmentation (TTA) Evaluation")
-        print("-"*80)
-        tta_transforms = get_test_time_augmentation(n_augmentations=5)
-        y_true_tta, y_pred_tta, y_prob_tta = evaluate_model(
-            model, test_loader, use_tta=True, tta_transforms=tta_transforms
-        )
-        metrics_tta = calculate_metrics(
-            y_true_tta, y_pred_tta, y_prob_tta,
-            class_names=CLASSES,
-            average='macro'
-        )
-        print("\n📊 TTA Metrics:")
-        print(f"  Accuracy:        {metrics_tta['accuracy']:.4f} (Δ = {metrics_tta['accuracy'] - metrics['accuracy']:+.4f})")
-        print(f"  Macro F1-Score:  {metrics_tta['macro_f1']:.4f} (Δ = {metrics_tta['macro_f1'] - metrics['macro_f1']:+.4f})")
-    print("\n" + "="*80)
-    print("EVALUATION COMPLETE")
-    print("="*80)
-    print(f"\n✓ Confusion matrix saved to: {cm_path}")
-    print(f"✓ ROC curves saved to: {roc_path}")
-    print(f"✓ Detailed report saved to: {report_path}")
-    print("\n🎯 Final Performance Summary:")
-    print(f"  Overall Accuracy: {metrics['accuracy']:.2%}")
-    print(f"  Macro F1-Score:   {metrics['macro_f1']:.2%}")
-    target_accuracy = 0.85
-    target_f1 = 0.75
-    if metrics['accuracy'] >= target_accuracy and metrics['macro_f1'] >= target_f1:
-        print(f"\n  ✅ Model meets performance targets!")
-        print(f"     Accuracy ≥ {target_accuracy:.0%}: ✓")
-        print(f"     Macro F1 ≥ {target_f1:.0%}: ✓")
-    else:
-        print(f"\n  ⚠️  Model below performance targets:")
-        if metrics['accuracy'] < target_accuracy:
-            print(f"     Accuracy {metrics['accuracy']:.2%} < {target_accuracy:.0%}")
-        if metrics['macro_f1'] < target_f1:
-            print(f"     Macro F1 {metrics['macro_f1']:.2%} < {target_f1:.0%}")
-        print(f"\n  Suggestions:")
-        print(f"    - Train for more epochs")
-        print(f"    - Adjust class weights")
-        print(f"    - Try different augmentations")
-        print(f"    - Use ensemble methods")
+
+    print(f"Macro F1 (95% CI): {mean:.4f} [{low:.4f}, {high:.4f}]")
+
+    results_dir = Path(RESULTS_DIR)
+    results_dir.mkdir(exist_ok=True)
+
+    plot_confusion_matrix(
+        y_true,
+        y_pred,
+        CLASSES,
+        save_path=results_dir / "confusion_matrix.png",
+    )
+
+    plot_roc_curves(
+        y_true,
+        y_prob,
+        CLASSES,
+        save_path=results_dir / "roc_curves.png",
+    )
+
+    save_metrics_report(
+        metrics,
+        CLASSES,
+        results_dir / "evaluation_report.txt",
+    )
+
+    print("\nEvaluation complete")
+    print(f"Results saved → {results_dir}")
 
 
 if __name__ == "__main__":

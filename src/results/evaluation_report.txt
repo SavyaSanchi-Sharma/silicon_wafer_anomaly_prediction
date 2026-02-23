@@ -4,22 +4,21 @@ SILICON WAFER ANOMALY DETECTION - EVALUATION REPORT
 
 OVERALL METRICS:
 --------------------------------------------------------------------------------
-Accuracy: 0.6596
-Macro Precision: 0.6760
-Macro Recall: 0.6596
-Macro F1-Score: 0.6515
-ROC-AUC (macro): 0.8245
+Accuracy: 0.5548
+Macro Precision: 0.5337
+Macro Recall: 0.6221
+Macro F1-Score: 0.5253
 
 PER-CLASS METRICS:
 --------------------------------------------------------------------------------
 Class                 Precision     Recall   F1-Score    Support
 --------------------------------------------------------------------------------
-clean                    0.9653     0.9881     0.9766        253
-scratch                  0.6989     0.2569     0.3757        253
-particle                 0.6287     0.5020     0.5582        253
-bridge                   0.9370     1.0000     0.9675        253
-contamination            0.4090     0.5771     0.4787        253
-coating_defect           0.4518     0.5375     0.4910        253
-etch_defect              0.4015     0.4269     0.4138        253
-other                    0.9158     0.9881     0.9506        253
+clean                    0.9868     0.9221     0.9534        244
+scratch                  0.8065     0.2964     0.4335        253
+particle                 0.7333     0.4583     0.5641        168
+bridge                   0.6364     1.0000     0.7778         21
+contamination            0.2659     0.5542     0.3594         83
+coating_defect           0.1386     0.2222     0.1707         63
+etch_defect              0.3401     0.5234     0.4123        128
+other                    0.3617     1.0000     0.5312         17
 ================================================================================
